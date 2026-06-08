@@ -1,0 +1,31 @@
+# ---- model artifacts / weights ----
+*.pth
+*.pt
+*.pb
+*.hdf5
+frozen_model*
+model.ckpt*
+
+# ---- training outputs ----
+*.log
+lcurve.out
+tb_log/
+timeline.json
+out.json
+output/
+checkpoints/
+
+# ---- python / packaging ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# ---- experiment tracking / notebooks ----
+wandb/
+.ipynb_checkpoints/
+
+# ---- editors / misc ----
+.DS_Store

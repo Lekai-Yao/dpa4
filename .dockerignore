@@ -1,0 +1,4 @@
+# The image only needs requirements.txt to rebuild the environment.
+# Code (deepmd-kit, configs, scripts) is provided at runtime via mounted disk.
+*
+!requirements.txt
