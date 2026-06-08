@@ -30,7 +30,8 @@ is a starting point — adjust `training_data` / `validation_data` paths and
 dpa4/
 ├── README.md            # this file
 ├── requirements.txt     # runtime deps snapshot (excludes deepmd-kit itself); shared by local + image
-├── Dockerfile           # rebuilds the same deps in the image (env only, no source)
+├── Dockerfile           # full env image (train + inference), CUDA 12.4 -devel base (has nvcc)
+├── Dockerfile.train     # training-only env image, CUDA 12.4 -runtime base (lighter, no nvcc)
 ├── .dockerignore
 ├── .gitignore
 ├── configs/
@@ -106,39 +107,75 @@ uv pip freeze --exclude-editable > dpa4/requirements.txt
 > path). The image rebuilds the **same** dependency set from `requirements.txt`,
 > so local and image install from one source of truth.
 
-## Cluster run (Docker: image supplies env, mounted disk supplies code)
+## Docker (image supplies env, mounted disk supplies code)
 
-Build and push the env image (deps only, no source):
+Two images are provided; both contain **deps only** (no source — code is mounted
+at runtime):
+
+| File | Base | Scope | nvcc | Size |
+|------|------|-------|------|------|
+| `Dockerfile.train` | `cuda:12.4.1-cudnn-runtime` | training only | no | ~15 GB |
+| `Dockerfile`       | `cuda:12.4.1-cudnn-devel`   | training + inference | yes | larger |
+
+### Build (training-only image — verified)
 
 ```bash
 cd dpa4
-docker build -t <registry>/dpa4-env:latest .
-docker push <registry>/dpa4-env:latest
+docker build -f Dockerfile.train -t dpa4-train:latest .
+# docker tag dpa4-train:latest <registry>/dpa4-train:latest && docker push ...
 ```
 
-On the cluster, mount the dev disk, editable-install the mounted deepmd-kit
-(`--no-deps`, since deps are already in the image), then train/test. The
-`-devel` base image provides the `nvcc` the ops compile needs:
+> **If the base image pull fails** (`not found` / DNS error): this host's docker
+> daemon has an unreachable registry mirror configured in `/etc/docker/daemon.json`
+> (`mirror.ccs.tencentyun.com`). Without root to fix it, pull the base from a
+> reachable mirror and retag so `FROM` uses the local cache:
+> ```bash
+> B=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+> docker pull docker.m.daocloud.io/$B && docker tag docker.m.daocloud.io/$B $B
+> ```
+
+### Run training (pin to a free GPU — do not grab all of them)
+
+The box is shared. Pick an idle GPU first, then expose only that one:
 
 ```bash
-docker run --gpus all \
-  -v /mnt/devdisk/DPA4:/workspace/DPA4 \
-  <registry>/dpa4-env:latest \
+nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader  # find idle
+docker run --rm --gpus '"device=4"' \
+  -v /mnt/afs/home/yaolekai/MLIP/DPA4:/workspace/DPA4 \
+  dpa4-train:latest \
   bash -c '
-    export DP_ENABLE_PYTORCH=1 DP_VARIANT=cuda PYTORCH_VERSION=2.6.0
     uv pip install --no-deps -e /workspace/DPA4/deepmd-kit && \
     cd /workspace/DPA4/dpa4 && \
     dp --pt train configs/dpa4.json'
 ```
 
-The runner may be docker / enroot / singularity — the idea is the same: image =
-deps, code = mounted disk. Editing code needs no image rebuild, just re-run.
+Verified 2026-06-08 on GPU 4: a 3-step `dp --pt train` ran inside the container
+(2.754 M params, loss decreasing, checkpoint saved). The container saw only the
+one pinned GPU. The runner may be docker / enroot / singularity — same idea:
+image = deps, code = mounted disk; editing code needs no image rebuild.
 
-> **Note on per-run cost**: the editable install recompiles the ops (~3 min) and
-> build isolation pulls TensorFlow into a throwaway build env each time. If the
-> venv is persisted (or the container is long-lived), do this install once. A
-> fully hermetic alternative is to add the build toolchain + `tensorflow` to the
-> image and use `--no-build-isolation`.
+> **Per-run cost (training image, ~13 min).** The runtime editable install uses
+> build isolation, which each time pulls the build toolchain **and TensorFlow**
+> into a throwaway build env and compiles deepmd-kit's TF Python ops — wasted work
+> for a PyTorch-only run (deepmd-kit's C++ `find_package(tensorflow)` is
+> unconditional and `DP_ENABLE_TENSORFLOW` defaults to 1). It still works; to
+> avoid it, persist `/opt/venv` across runs (install once) or, for a hermetic
+> image, bake the build toolchain + `tensorflow` in and use `--no-build-isolation`.
+
+### Run training + inference (full image)
+
+Same as above but with the `Dockerfile` image and the ops-compile env vars, so
+`dp --pt test` / `eval.py` also work (needs the `-devel` base's `nvcc`):
+
+```bash
+docker run --rm --gpus '"device=4"' \
+  -v /mnt/afs/home/yaolekai/MLIP/DPA4:/workspace/DPA4 \
+  dpa4-full:latest \
+  bash -c '
+    export DP_ENABLE_PYTORCH=1 DP_VARIANT=cuda PYTORCH_VERSION=2.6.0
+    uv pip install --no-deps -e /workspace/DPA4/deepmd-kit && \
+    cd /workspace/DPA4/dpa4 && dp --pt train configs/dpa4.json'
+```
 
 ### Evaluation
 

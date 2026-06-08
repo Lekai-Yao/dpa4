@@ -1,0 +1,37 @@
+# DPA4 *training* environment image — dependencies only, no source code.
+# Scope: training (`dp --pt train`) only. Inference (dp test / DeepEval) needs
+# deepmd-kit's compiled CUDA ops and is intentionally OUT OF SCOPE here, so this
+# uses the lighter CUDA 12.4 *runtime* base (no nvcc). For the full train+infer
+# image see ./Dockerfile (-devel base).
+#
+# deepmd-kit and this repo's code are mounted from the cluster disk at runtime;
+# the image only provides the Python environment.
+#
+# TODO(confirm): verify 12.4 matches the cluster's driver (`nvidia-smi`). torch
+#   cu124 (in requirements.txt) needs a >=12.4 driver on the host.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
+
+# git + build-essential are needed at runtime: the editable install of the
+# mounted deepmd-kit uses build isolation, which transiently pulls the build
+# toolchain (scikit-build-core/cmake/ninja) and TensorFlow into a throwaway
+# build env and runs a C++ configure (gcc). No nvcc is needed for the
+# training-only (pure-Python) build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip git ca-certificates build-essential && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install uv -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# Build the venv and install the runtime deps (cu124 torch, e3nn, ...).
+# The ubuntu22.04 base ships Python 3.10, but our deps require >=3.11 (matching
+# the dev venv), so let uv provide a standalone CPython 3.11.
+COPY requirements.txt /tmp/requirements.txt
+RUN uv venv --python 3.11 /opt/venv && uv pip install -r /tmp/requirements.txt
+
+# Sanity: torch + e3nn import (CUDA availability is only testable at `docker run
+# --gpus all` time, not during build).
+RUN python -c "import torch, e3nn; print('image deps OK | torch', torch.__version__, '| e3nn', e3nn.__version__)"
