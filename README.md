@@ -35,10 +35,96 @@ dpa4/
 ├── .dockerignore
 ├── .gitignore
 ├── configs/
-│   └── dpa4.json        # DPA4 training config (provenance noted in its _source field)
+│   ├── dpa4.json        # DPA4 water training config (provenance noted in its _source field)
+│   └── dpa4_mptrj.json  # DPA4-Air on MPtrj (94-element type_map, e+f+v loss, LMDB data)
 └── scripts/
-    └── eval.py          # minimal eval skeleton (load model, compute E/F errors)
+    ├── eval.py          # minimal eval skeleton (load model, compute E/F errors)
+    ├── aselmdb_to_deepmd_lmdb.py  # MPtrj .aselmdb (ASE schema) -> deepmd LMDB converter
+    ├── wandb_lcurve.py  # sidecar: tail lcurve.out -> live wandb (project dpa4_mptrj)
+    └── train_mptrj.sh   # editable-install + torchrun launch + wandb sidecar for 8x A100
 ```
+
+## MPtrj (DPA4-Air) training
+
+`configs/dpa4_mptrj.json` is the DPA4-Air parameter set (same architecture as
+`dpa4.json`, which `doc/model/dpa4.md` calls "close to the pretrained DPA4-Air
+model") retargeted to MPtrj. Two MPtrj-specific changes: a 94-element Z-ordered
+`type_map` (H..Pu) and `descriptor.sel: 200` (denser neighbor shells than water).
+
+> **Data format gotcha.** deepmd-kit **cannot read MPtrj's `.aselmdb` files.**
+> Those are the ASE/fairchem LMDB schema (zlib-compressed ASE-db JSON rows);
+> deepmd's `is_lmdb()` only accepts `*.lmdb` / `data.mdb` and its own msgpack
+> frame layout. The raw `MPtrj_2022.9_full.json` (pymatgen dicts) is not directly
+> usable either. **Convert first** with `scripts/aselmdb_to_deepmd_lmdb.py`
+> (uses only `lmdb+zlib+json+numpy+msgpack`; verified to round-trip through
+> deepmd's `LmdbDataReader`). Virial uses the dpdata convention
+> `virial = -stress * volume`; pass `--no-virial` (and zero the `v` loss prefs)
+> to skip it.
+
+```bash
+# one-time conversion (writes deepmd LMDB next to the source aselmdb)
+python scripts/aselmdb_to_deepmd_lmdb.py \
+  --src /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/train \
+  --dst /mnt/afs/share/dataset/periodicSystem/MPtrj/deepmd_lmdb/train.lmdb
+python scripts/aselmdb_to_deepmd_lmdb.py \
+  --src /mnt/afs/share/dataset/periodicSystem/MPtrj/aselmdb/val \
+  --dst /mnt/afs/share/dataset/periodicSystem/MPtrj/deepmd_lmdb/val.lmdb
+
+# launch on 8x A100 (deepmd uses torchrun + `--no-python dp --pt train`)
+bash scripts/train_mptrj.sh
+```
+
+### Schedule & batch size (20 epochs on 8x A100)
+
+`train.lmdb` has **1,420,395** frames. At `batch_size: "auto:256"` (each batch
+holds >=256 atoms; ~256 atoms/GPU, ~2048 atoms/optimizer-step across 8 ranks) the
+dataset is **157,809** same-nloc batches per pass, i.e. **19,727 optimizer
+steps/epoch** over 8 ranks. The config therefore pins:
+
+- `numb_steps: 394540` = 20 x 19,727. **Pinned, not `num_epoch`**: 157,809 isn't
+  divisible by 8, so under `num_epoch` each rank would compute `num_steps` from
+  its *own* dataloader length and disagree by 1 -> DDP desync. A fixed `numb_steps`
+  keeps all 8 ranks (and the wsd LR decay horizon) in lockstep.
+- `save_freq: 19727` ~= one checkpoint per epoch (`max_ckpt_keep: 5`).
+
+### Run dir & checkpoint naming (mirrors equiformer's `--run-dir`/`--identifier`)
+
+deepmd writes **every** output (checkpoints, `lcurve.out`, stat hdf5) to the CWD
+and has no `--run-dir`/`--identifier` flag, so `train_mptrj.sh` `cd`s into a
+per-run dir before launching — that `cd` *is* the run-dir mechanism. The config
+is passed by **absolute** path (we've left the repo dir). Outputs land at:
+
+```
+/mnt/afs/share/checkpoint/dpa4/yaolekai/dpa4-air_mptrj_20ep_<YYYYmmdd-HHMMSS>/
+    dpa4-air.ckpt-<step>.pt      # save_ckpt: "dpa4-air.ckpt" -> ckpts self-describe
+    lcurve.out                   # learning curve (also the wandb source, below)
+    dpa4_mptrj.hdf5              # neighbor-stat cache (stat_file)
+```
+
+The run dir keeps a timestamp so reruns never clobber each other (override the
+prefix with `IDENT=... bash scripts/train_mptrj.sh`).
+
+### Live wandb logging
+
+deepmd-kit has **no native wandb support**, so `scripts/wandb_lcurve.py` runs as a
+sidecar: it tails `lcurve.out` (deepmd `flush()`es one row per `disp_freq=1000`
+steps — genuinely live, unlike the TensorBoard writer's ~120 s buffer) and
+streams each row to wandb via `wandb.log(..., step=step)`. `train_mptrj.sh`
+launches it on **node 0 only** (deepmd writes `lcurve.out` on global rank 0),
+runs training, then drops a `.train_done` sentinel so the sidecar drains the final
+rows and calls `wandb.finish()`. A training crash still ships partial curves, and
+the script exits with training's real return code.
+
+| | value |
+|---|---|
+| wandb project | `dpa4_mptrj` |
+| wandb **display name** | `dpa4-air_mptrj_20ep` (no timestamp) |
+| wandb run **id** (internal) | the timestamped `IDENT` — unique per job, so reruns never collide on step ordering and a restarted sidecar `resume`s the same run |
+| logged scalars | `rmse_{,e_,f_,v_}{val,trn}`, `lr` (per 1000 steps, ~395 points); `nan` columns and out-of-order steps are dropped |
+
+> wandb's API key / timeout are configured **outside** this script (env); the
+> script only `uv pip install -q wandb` and sets the project/name/id. To watch
+> progress without wandb: `lcurve.out`, stdout, or `numpy.loadtxt("lcurve.out")`.
 
 ## Environment facts (verified on the dev box)
 
